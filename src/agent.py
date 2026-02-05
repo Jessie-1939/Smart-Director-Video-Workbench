@@ -82,21 +82,77 @@ class VideoPromptAgent:
         self._settings = settings
         self._client = OpenAI(api_key=settings.api_key, base_url=settings.base_url)
         self._messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.current_image_path = None
+        self._image_context_text: str = ""
 
     def reset(self) -> None:
         self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.current_image_path = None
+        self._image_context_text = ""
+
+    def get_state(self) -> Dict[str, Any]:
+        """Serialize current agent state for saving."""
+        return {
+            "messages": self._messages,
+            "current_image_path": self.current_image_path,
+            "image_context_text": self._image_context_text,
+        }
+
+    def load_state(self, state: Dict[str, Any]) -> None:
+        """Restore agent state."""
+        self._messages = state.get("messages", [{"role": "system", "content": SYSTEM_PROMPT}])
+        self.current_image_path = state.get("current_image_path")
+        self._image_context_text = state.get("image_context_text", "")
+
+    def set_image(self, image_path: str) -> None:
+        """设置当前参考图片路径"""
+        self.current_image_path = image_path
+        self._image_context_text = _summarize_image_tech(image_path)
+        
+    def _encode_image(self, image_path: str) -> str:
+        """将图片编码为base64字符串"""
+        import base64
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
 
     def step(self, user_text: str, force_finalize: bool = False) -> AgentResponse:
         user_text = (user_text or "").strip()
         if force_finalize:
             user_text = user_text + "\n\n（用户指令：现在请直接总结并输出最终可粘贴提示词，必要时自行做合理补全，并在负面提示里标明避免项。）"
 
-        self._messages.append({"role": "user", "content": user_text})
+        # 如果有图片：
+        # - 默认用“技术摘要”文本注入，保证所有文本模型都可用
+        # - 仅当 ENABLE_VISION=true 时，尝试随消息发送图片（需要模型支持视觉输入）
+        if self.current_image_path and self._image_context_text:
+            user_text = user_text + "\n\n[参考图片-技术摘要]\n" + self._image_context_text
+
+        if self.current_image_path and self._settings.enable_vision and self._settings.vision_model:
+            try:
+                base64_image = self._encode_image(self.current_image_path)
+                message_content = [
+                    {"type": "text", "text": user_text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                    },
+                ]
+                self._messages.append({"role": "user", "content": message_content})
+            except Exception as e:
+                print(f"图片随消息发送失败（将仅发送文本摘要）: {e}")
+                self._messages.append({"role": "user", "content": user_text})
+        else:
+            self._messages.append({"role": "user", "content": user_text})
 
         extra_body = {"enable_thinking": self._settings.enable_thinking}
 
+        model_to_use = (
+            self._settings.vision_model
+            if (self._settings.enable_vision and self._settings.vision_model)
+            else self._settings.model
+        )
+
         completion = self._client.chat.completions.create(
-            model=self._settings.model,
+            model=model_to_use,
             messages=self._messages,
             extra_body=extra_body,
             temperature=0.7,
@@ -169,3 +225,46 @@ def _safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
         return json.loads(candidate)
     except Exception:
         return None
+
+
+def _summarize_image_tech(image_path: str) -> str:
+    """Generate a compact technical summary of the reference image.
+
+    This is used when the model doesn't support vision inputs. Keeps output short and model-friendly.
+    """
+    try:
+        from PIL import Image, ImageStat
+    except Exception:
+        return "（未安装 Pillow，无法提取图片技术摘要）"
+
+    try:
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            aspect = w / h if h else 0
+            stat = ImageStat.Stat(im)
+            r, g, b = [int(x) for x in stat.mean[:3]]
+            # perceived brightness (rough)
+            brightness = int(0.2126 * r + 0.7152 * g + 0.0722 * b)
+            avg_hex = f"#{r:02x}{g:02x}{b:02x}"
+
+            # classify common aspect ratios roughly
+            ar = ""
+            if 1.7 <= aspect <= 1.85:
+                ar = "16:9附近"
+            elif 0.95 <= aspect <= 1.05:
+                ar = "1:1附近"
+            elif 1.3 <= aspect <= 1.4:
+                ar = "4:3附近"
+            elif aspect > 1.9:
+                ar = "超宽屏"
+            elif aspect < 0.9:
+                ar = "竖图"
+
+            return (
+                f"分辨率: {w}x{h}（{ar}）\n"
+                f"平均色: {avg_hex}；亮度(0-255): {brightness}\n"
+                "建议用法: 把画面构图/主体位置/光影对比/色调参考此图，细节以文字为准。"
+            )
+    except Exception as e:
+        return f"（图片技术摘要提取失败: {e}）"

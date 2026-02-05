@@ -1,54 +1,91 @@
-# 智能视频描述词生成（即梦/剪映 Prompt Agent）
+# Smart Director (AI Video Agent)
 
-面向：<https://jimeng.jianying.com/ai-tool/generate>
+A professional desktop application for AI-assisted video creation, designed to act as your "AI Director" throughout the creative process.
 
-即梦视频生成需要“描述词/提示词”，但人类往往描述不够全面。
-本项目提供一个 **Qt 桌面交互界面**：
-
-- 你先粗略描述想要的视频内容
-- AI Agent 自动分析拆解，找出缺失信息
-- 通过 **多轮追问** 不断补全细节
-- 最后输出 **足够详实、可直接粘贴** 的视频提示词（**画面 + 音乐**）
-- 描写目标：电影级镜头语言 + 小说式局部细节
-
-模型：默认使用 `qwen3-max-2026-01-23`（DashScope / 阿里云百炼 OpenAI 兼容接口）。
+[ **English** ](README.md) | [ **简体中文** ](README_zh.md)
 
 ---
 
-## 本地运行
+Unlike simple prompt generators, Smart Director provides a full workflow: from **idea decomposition**, to **shot management**, to **automated asset generation** (Task Queue).
 
-### 1) 安装依赖
+> **Powered by Alibaba DashScope (Wan2.1 / Qwen)**  
+> Strictly uses Cloud APIs (No local GPU required).
 
-在项目目录下安装：
+##  Key Features
 
-- `openai`（OpenAI SDK，用于调用 DashScope 的 OpenAI 兼容接口）
-- `python-dotenv`（读取 `.env`）
-- `PySide6`（Qt GUI）
+- **Structural Prompting**: Decomposes ideas into three layers: "Visual Prompt" (for Image Gen), "Director's Script" (for Video Gen), and "Negative/Style" constraints.
+- **Project Management**: Organize your work into unlimited Projects, Sequences, Scenes, and Shots.
+- **Task Queue System**: Asynchronous background generation. Queue up 10 variants of a shot and let it run while you edit the next scene.
+- **Strictly Cloud-Native**: Built for the DashScope API ecosystem (Qwen-Max for logic, Wan for video, Qwen-VL for image understanding).
+- **Format Control**: Automatically ensures prompts meet the strict length and format requirements of video generation models.
 
-依赖列表见：`requirements.txt`
+##  Project Structure
 
-### 2) 配置 `.env`
+```
+Smart-Director/
+ src/                  # Core Application Source Code
+    main.py           # GUI Entry Point (PySide6)
+    agent.py          # LLM Logic (Qwen)
+    project_store.py  # JSON-based Persistence Layer
+    task_queue.py     # Background Execution Engine
+    dashscope_provider.py # API Integration
+ tests/                # Unit & Integration Tests (100% Coverage)
+ sessions/             # Local Project Storage (Auto-created)
+ run.py                # Application Launcher
+ requirements.txt      # Python Dependencies
+```
 
-把 `.env.example` 复制为 `.env`，并填写：
+##  Getting Started
 
-- `DASHSCOPE_API_KEY=...`
+### 1. Installation
 
-注意：`.env` 已加入 `.gitignore`，请不要把 Key 提交到仓库。
+```bash
+# Clone the repository
+git clone https://github.com/YourUsername/Smart-Director.git
+cd Smart-Director
 
-> 你之前的 `.env` 里包含过真实 Key（已被我清理为占位符）。为了安全，建议你在控制台 **撤销/重置** 那个 Key，再填入新 Key。
+# Install dependencies
+pip install -r requirements.txt
+```
 
-### 3) 启动
+### 2. Configuration
 
-运行：`python main.py`
+Create a `.env` file in the root directory:
 
----
+```ini
+# .env
+DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
+# Optional: Set default models
+MODEL_LLM="qwen-max"
+MODEL_IMAGE="wan-image-v1"
+MODEL_VIDEO="wan-video-v1"
+```
 
-## 使用方式
+### 3. Run
 
-1. 在输入框里写下你想要的视频（写得粗一点也没关系）
-2. 点“发送”，Agent 会每轮最多问 1~3 个问题来补齐细节
-3. 你逐条回答、继续发送
-4. 信息足够时，Agent 会输出“最终可粘贴提示词”（包含画面与音乐）
-5. 也可以随时点“直接总结生成最终提示词”强制收束
+```bash
+python run.py
+```
 
-输出会覆盖常用的生成要素：主体/场景/时间/风格/镜头/光影/色彩/动作/参数（时长、比例、fps等）/音乐与音效/负面避免项。
+##  Development
+
+This project uses `PySide6` for the UI and `Pytest` for reliability.
+
+**Running Tests:**
+```bash
+pytest -q
+```
+
+##  Workflow Guide
+
+1. **Create Project**: Start a new narrative.
+2. **Draft Scene**: Enter a rough idea (e.g., "A cyberpunk detective in rain").
+3. **AI Refinement**: The Agent expands this into visual details, camera angles, and lighting.
+4. **Generate Assets**:
+   - **Image Check**: Generate a still image to verify the look.
+   - **Video Gen**: Send to the Video Generation Queue.
+5. **Review**: Pick the best "Candidate" from your generated assets.
+
+##  License
+
+This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](LICENSE) file for details.
