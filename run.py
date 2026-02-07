@@ -1,12 +1,20 @@
-import sys
+#!/usr/bin/env python3
+"""Smart Director v2 — Application Launcher."""
+
 import os
+import sys
 
-# Add 'src' to python path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-src_dir = os.path.join(current_dir, 'src')
-sys.path.insert(0, src_dir)
+# Ensure src/ is on the import path
+_root = os.path.dirname(os.path.abspath(__file__))
+_src = os.path.join(_root, "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
 
-from src.main import main
+
+def main():
+    from app import create_app
+    return create_app()
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

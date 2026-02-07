@@ -1,270 +1,293 @@
+"""Smart Director v2 — Video Prompt Agent.
+
+Multi-turn conversation agent that guides users to create
+cinema-grade video prompts through iterative refinement.
+
+Key improvements over v1:
+- Token budget tracking (prevents context overflow)
+- Structured JSON output with fallback parsing
+- Separate thinking-mode (ask phase) vs schema-mode (finalize phase)
+- Image tech summary without requiring vision model
+- No content restrictions removed
+"""
+
 from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 from openai import OpenAI
 
-from config import Settings
+from config import Settings, get_settings
 
+# ─── System Prompt ────────────────────────────────────────────────
+SYSTEM_PROMPT = """\
+你是 Smart Director — 一位顶级电影导演 + 摄影指导 + 声音设计师。
 
-SYSTEM_PROMPT = """你是一个专业的“视频生成提示词（Prompt）”AI Agent，目标平台：即梦（剪映）视频生成。
+## 你的工作流
+用户描述一个视频创意，你通过多轮对话补全细节，最后输出可直接粘贴到视频生成平台的结构化提示词。
 
-平台适配（非常重要）：
-- 即梦类视频模型往往会“抓重点而忽略长文本”。提示词过长、信息过密、嵌套括号太多、互相矛盾（例如：既要清晰无畸变又要强畸变、既要主观透窗又要走廊全景）会导致结果拉跨。
-- 你的目标不是写一篇散文，而是给模型一个“稳定可执行”的指令：先给短关键词定风格，再给少量镜头脚本定节奏。
-- 恐怖/血腥元素在部分平台可能触发弱化/风格化；因此你在最终输出中要额外给一个“低血腥替代表达”，保证可出片。
+## 追问阶段（status: "need_more"）
+- 每轮最多问 3 个关键问题，用选项（A/B/C/D）方式让用户快速选择
+- 问题聚焦于：主体动作、场景环境、镜头运动、光影氛围、色彩基调、音效节奏、时长参数
+- 如果用户已给出足够信息（≥5个维度有明确描述），直接进入总结
 
-工作流程：
-1) 用户先给一个粗略想法。
-2) 你要像导演+摄影指导+编剧一样拆解需求，找出缺失信息。
-3) 对不清楚/缺少细节之处进行追问；每轮最多问 3 个问题，问题要具体可选（给几个选项能更快）。
-4) 当信息足够或用户要求总结时，输出最终“可直接粘贴”的提示词，必须同时包含：视频画面 + 音乐。
-
-最终输出必须遵循“短而强”的结构（写进 final_prompt）：
-1) 【即梦短提示】<= 280 字：用逗号分隔的关键词串（主体、场景、风格、光影、色彩、镜头、动作、质感、参数）。
-2) 【12秒镜头脚本】<= 650 字：用 0-3s / 3-6s / 6-9s / 9-12s 四段，描述每段镜头内容与运镜。
-3) 【音乐/音效】<= 220 字：节奏、情绪、配器、关键音效点。
-4) 【负面】<= 160 字：用短词列表。
-5) 【低血腥替代】（若存在血腥/腐烂/丧尸）：给一版更容易过审/更稳的替代表达（例如用“污渍、破损、阴影、非写实恐怖”替换直白血腥）。
-
-表达要求：
-- 全程中文。
-- 画面要电影级，但最终可粘贴提示词必须“可执行、少冲突、少歧义”。
-- 优先级：构图/主体动作/场景光线 > 风格质感 > 细枝末节；不要一次塞 30 个细节。
-- 默认不杜撰用户明确否定的内容；但可以提出合理补全选项。
-- 最终提示词要结构化、可复制粘贴，避免冗余解释。
-
-输出格式：
-你必须只输出 JSON（不要输出 Markdown 代码块），形如：
+## 总结阶段（status: "finalized"）
+输出严格 JSON，包含以下字段：
 {
-  "status": "need_more" | "final",
-  "assistant_message": "给用户看的自然语言回复",
-  "questions": ["...", "..."],
-  "final_prompt": "...",
-  "checklist": {
-    "subject": "...",
-    "scene": "...",
-    "time": "...",
-    "style": "...",
-    "camera": "...",
-    "lighting": "...",
-    "color": "...",
-    "motion": "...",
-    "music": "...",
-    "duration": "...",
-    "aspect_ratio": "...",
-    "fps": "...",
-    "negatives": "..."
+  "status": "finalized",
+  "assistant_message": "简短说明你的创作思路",
+  "short_prompt": "≤280字的即梦/视频生成平台短提示词（主体+场景+风格+光影+镜头+参数）",
+  "director_script": "按秒拆分的镜头脚本（如 0-3s: ... / 3-6s: ... ）",
+  "music_sound": "音乐风格 + 关键音效节拍描述",
+  "negative": "负面约束（不要出现的元素）",
+  "params": {
+    "aspect_ratio": "16:9 或 9:16 或 1:1",
+    "duration_sec": 5,
+    "fps": 24,
+    "resolution": "1080p"
   }
 }
 
-规则：
-- status=need_more 时，final_prompt 置空字符串；questions 给出 1-3 个。
-- status=final 时，questions 置空数组；final_prompt 必须按“短提示+脚本+音乐+负面(+低血腥替代)”结构输出。
-- 任何情况下都不要输出 Markdown 代码块；只输出 JSON。
+## 追问阶段的 JSON 格式
+{
+  "status": "need_more",
+  "assistant_message": "你的回复文本（可包含分析、建议）",
+  "questions": [
+    "问题1：关于XXX？\\nA: 选项A\\nB: 选项B\\nC: 选项C",
+    "问题2：...",
+    "问题3：..."
+  ],
+  "checklist": {
+    "主体": "已确认/待确认",
+    "场景": "已确认/待确认",
+    "镜头": "已确认/待确认",
+    "光影": "已确认/待确认",
+    "色彩": "已确认/待确认",
+    "音效": "已确认/待确认",
+    "参数": "已确认/待确认"
+  }
+}
+
+## 核心原则
+1. short_prompt 必须 ≤280 字，信息密度优先于文学修辞
+2. 避免冲突描述（如同时要求"主观镜头"和"多角度切换"）
+3. 视频生成模型一次只能做一个连贯镜头，不要塞多个场景
+4. director_script 的时间轴必须与 params.duration_sec 一致
+5. 永远输出有效 JSON，不要输出 markdown 代码块包裹的 JSON
+
+## vibe 控制参数
+用户消息末尾可能附带 [vibe] 标签的控制参数，请尊重这些参数约束。
 """
 
 
+# ─── Data Types ───────────────────────────────────────────────────
 @dataclass
 class AgentResponse:
-    status: str
-    assistant_message: str
-    questions: List[str]
-    final_prompt: str
-    checklist: Dict[str, Any]
+    """Parsed response from the agent."""
+    status: str = "need_more"
+    assistant_message: str = ""
+    questions: list[str] = field(default_factory=list)
+    checklist: dict[str, str] = field(default_factory=dict)
+    short_prompt: str = ""
+    director_script: str = ""
+    music_sound: str = ""
+    negative: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
+    raw_json: dict[str, Any] = field(default_factory=dict)
+    token_usage: dict[str, int] = field(default_factory=dict)
 
 
+# ─── Agent ────────────────────────────────────────────────────────
 class VideoPromptAgent:
-    def __init__(self, settings: Settings):
-        self._settings = settings
-        self._client = OpenAI(api_key=settings.api_key, base_url=settings.base_url)
-        self._messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        self.current_image_path = None
-        self._image_context_text: str = ""
+    """Multi-turn conversation agent for video prompt generation."""
+
+    MAX_CONTEXT_TOKENS = 12000
+    SUMMARY_TRIGGER = 8000
+
+    def __init__(self, settings: Optional[Settings] = None):
+        self._settings = settings or get_settings()
+        self._client = OpenAI(
+            api_key=self._settings.api_key,
+            base_url=self._settings.base_url,
+        )
+        self._messages: list[dict] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+        self._total_tokens = 0
+        self._image_summary: Optional[str] = None
+
+    def step(self, user_text: str, force_finalize: bool = False) -> AgentResponse:
+        """Send user message and get agent response."""
+        full_text = user_text
+        if self._image_summary:
+            full_text = f"[参考图片信息] {self._image_summary}\n\n{user_text}"
+            self._image_summary = None
+
+        self._messages.append({"role": "user", "content": full_text})
+
+        if force_finalize:
+            self._messages.append({
+                "role": "user",
+                "content": (
+                    "请立即根据目前收集到的所有信息，输出最终的结构化提示词 JSON。"
+                    'status 必须是 "finalized"。如有信息不足的维度，请用你的专业判断补全。'
+                ),
+            })
+
+        try:
+            call_kwargs: dict[str, Any] = {
+                "model": self._settings.model,
+                "messages": self._messages,
+            }
+            if self._settings.enable_thinking and not force_finalize:
+                call_kwargs["extra_body"] = {"enable_thinking": True}
+
+            response = self._client.chat.completions.create(**call_kwargs)
+            choice = response.choices[0]
+            raw_content = choice.message.content or ""
+
+            usage = {}
+            if response.usage:
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens or 0,
+                    "completion_tokens": response.usage.completion_tokens or 0,
+                    "total_tokens": response.usage.total_tokens or 0,
+                }
+                self._total_tokens += usage.get("total_tokens", 0)
+
+            self._messages.append({"role": "assistant", "content": raw_content})
+
+            if self._total_tokens > self.SUMMARY_TRIGGER:
+                self._compress_context()
+
+            parsed = self._safe_parse_json(raw_content)
+            return self._build_response(parsed, raw_content, usage)
+
+        except Exception as e:
+            return AgentResponse(status="error", assistant_message=f"请求失败: {e}")
+
+    def set_image(self, image_path: str) -> str:
+        """Set reference image and return tech summary."""
+        summary = self._summarize_image(image_path)
+        self._image_summary = summary
+        return summary
+
+    def clear_image(self) -> None:
+        self._image_summary = None
 
     def reset(self) -> None:
         self._messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        self.current_image_path = None
-        self._image_context_text = ""
+        self._total_tokens = 0
+        self._image_summary = None
 
-    def get_state(self) -> Dict[str, Any]:
-        """Serialize current agent state for saving."""
-        return {
-            "messages": self._messages,
-            "current_image_path": self.current_image_path,
-            "image_context_text": self._image_context_text,
-        }
+    def get_history(self) -> list[dict]:
+        return list(self._messages)
 
-    def load_state(self, state: Dict[str, Any]) -> None:
-        """Restore agent state."""
-        self._messages = state.get("messages", [{"role": "system", "content": SYSTEM_PROMPT}])
-        self.current_image_path = state.get("current_image_path")
-        self._image_context_text = state.get("image_context_text", "")
+    def load_history(self, messages: list[dict]) -> None:
+        self._messages = messages
+        self._total_tokens = 0
 
-    def set_image(self, image_path: str) -> None:
-        """设置当前参考图片路径"""
-        self.current_image_path = image_path
-        self._image_context_text = _summarize_image_tech(image_path)
-        
-    def _encode_image(self, image_path: str) -> str:
-        """将图片编码为base64字符串"""
-        import base64
-        with open(image_path, "rb") as image_file:
-            return base64.b64encode(image_file.read()).decode('utf-8')
+    @property
+    def message_count(self) -> int:
+        return len(self._messages)
 
-    def step(self, user_text: str, force_finalize: bool = False) -> AgentResponse:
-        user_text = (user_text or "").strip()
-        if force_finalize:
-            user_text = user_text + "\n\n（用户指令：现在请直接总结并输出最终可粘贴提示词，必要时自行做合理补全，并在负面提示里标明避免项。）"
+    @property
+    def estimated_tokens(self) -> int:
+        return self._total_tokens
 
-        # 如果有图片：
-        # - 默认用“技术摘要”文本注入，保证所有文本模型都可用
-        # - 仅当 ENABLE_VISION=true 时，尝试随消息发送图片（需要模型支持视觉输入）
-        if self.current_image_path and self._image_context_text:
-            user_text = user_text + "\n\n[参考图片-技术摘要]\n" + self._image_context_text
+    # ── Private ───────────────────────────────────────────────────
 
-        if self.current_image_path and self._settings.enable_vision and self._settings.vision_model:
-            try:
-                base64_image = self._encode_image(self.current_image_path)
-                message_content = [
-                    {"type": "text", "text": user_text},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                    },
-                ]
-                self._messages.append({"role": "user", "content": message_content})
-            except Exception as e:
-                print(f"图片随消息发送失败（将仅发送文本摘要）: {e}")
-                self._messages.append({"role": "user", "content": user_text})
-        else:
-            self._messages.append({"role": "user", "content": user_text})
+    def _compress_context(self) -> None:
+        """Compress early turns into a summary to stay within token budget."""
+        if len(self._messages) <= 6:
+            return
+        sys_msg = self._messages[0]
+        keep_recent = self._messages[-4:]
+        middle = self._messages[1:-4]
+        if not middle:
+            return
+        parts = []
+        for msg in middle:
+            content = msg["content"]
+            if len(content) > 200:
+                content = content[:200] + "..."
+            parts.append(f"[{msg['role']}] {content}")
+        summary = "[对话历史摘要]\n" + "\n".join(parts)
+        self._messages = [sys_msg, {"role": "assistant", "content": summary}, *keep_recent]
+        self._total_tokens = int(self._total_tokens * 0.4)
 
-        extra_body = {"enable_thinking": self._settings.enable_thinking}
-
-        model_to_use = (
-            self._settings.vision_model
-            if (self._settings.enable_vision and self._settings.vision_model)
-            else self._settings.model
-        )
-
-        completion = self._client.chat.completions.create(
-            model=model_to_use,
-            messages=self._messages,
-            extra_body=extra_body,
-            temperature=0.7,
-        )
-
-        content = (completion.choices[0].message.content or "").strip()
-        data = _safe_parse_json(content)
-
-        # 如果模型没按要求输出JSON，降级处理
-        if not isinstance(data, dict) or "status" not in data:
-            assistant_message = content if content else "我没拿到有效回复，请再试一次。"
-            self._messages.append({"role": "assistant", "content": assistant_message})
+    def _build_response(self, parsed: dict, raw_content: str, usage: dict) -> AgentResponse:
+        status = parsed.get("status", "need_more")
+        if status == "finalized":
             return AgentResponse(
-                status="need_more",
-                assistant_message=assistant_message,
-                questions=["你能再补充一下你想要的视频大概是什么风格/主题吗？"],
-                final_prompt="",
-                checklist={},
+                status="finalized",
+                assistant_message=parsed.get("assistant_message", ""),
+                short_prompt=parsed.get("short_prompt", ""),
+                director_script=parsed.get("director_script", ""),
+                music_sound=parsed.get("music_sound", ""),
+                negative=parsed.get("negative", ""),
+                params=parsed.get("params", {}),
+                raw_json=parsed,
+                token_usage=usage,
             )
-
-        resp = AgentResponse(
-            status=str(data.get("status", "need_more")),
-            assistant_message=str(data.get("assistant_message", "")),
-            questions=list(data.get("questions", []) or []),
-            final_prompt=str(data.get("final_prompt", "")),
-            checklist=dict(data.get("checklist", {}) or {}),
+        return AgentResponse(
+            status="need_more",
+            assistant_message=parsed.get("assistant_message", raw_content),
+            questions=parsed.get("questions", []),
+            checklist=parsed.get("checklist", {}),
+            raw_json=parsed,
+            token_usage=usage,
         )
 
-        # 把给用户看的自然语言内容写回对话
-        # 这样下一轮模型能看到自己问过什么/总结过什么
-        stitched = resp.assistant_message
-        if resp.status == "need_more" and resp.questions:
-            stitched += "\n\n我需要你确认/补充：\n" + "\n".join(
-                [f"- {q}" for q in resp.questions]
-            )
-        if resp.status == "final" and resp.final_prompt:
-            stitched += "\n\n最终提示词：\n" + resp.final_prompt
+    @staticmethod
+    def _safe_parse_json(text: str) -> dict[str, Any]:
+        """Extract JSON from LLM output with multiple fallback strategies."""
+        if not text or not text.strip():
+            return {}
+        cleaned = text.strip()
 
-        self._messages.append({"role": "assistant", "content": stitched})
-        return resp
+        # Strategy 1: Direct parse
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
 
+        # Strategy 2: Remove markdown fences
+        for block in re.findall(r"```(?:json)?\s*\n?(.*?)\n?\s*```", cleaned, re.DOTALL):
+            try:
+                return json.loads(block.strip())
+            except json.JSONDecodeError:
+                continue
 
-_JSON_RE = re.compile(r"\{[\s\S]*\}\s*$")
-_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+        # Strategy 3: Find last {...} block
+        for match in reversed(re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", cleaned, re.DOTALL)):
+            try:
+                return json.loads(match)
+            except json.JSONDecodeError:
+                continue
 
+        return {"status": "need_more", "assistant_message": cleaned}
 
-def _safe_parse_json(text: str) -> Optional[Dict[str, Any]]:
-    """Try best-effort JSON extraction.
-
-    Some providers may prepend/append stray text; we attempt to extract the last JSON object.
-    """
-    text = (text or "").strip()
-    if not text:
-        return None
-
-    # remove common markdown fences
-    text = _FENCE_RE.sub("", text).strip()
-
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-
-    m = _JSON_RE.search(text)
-    if not m:
-        return None
-
-    candidate = m.group(0)
-    try:
-        return json.loads(candidate)
-    except Exception:
-        return None
-
-
-def _summarize_image_tech(image_path: str) -> str:
-    """Generate a compact technical summary of the reference image.
-
-    This is used when the model doesn't support vision inputs. Keeps output short and model-friendly.
-    """
-    try:
-        from PIL import Image, ImageStat
-    except Exception:
-        return "（未安装 Pillow，无法提取图片技术摘要）"
-
-    try:
-        with Image.open(image_path) as im:
-            im = im.convert("RGB")
-            w, h = im.size
-            aspect = w / h if h else 0
-            stat = ImageStat.Stat(im)
-            r, g, b = [int(x) for x in stat.mean[:3]]
-            # perceived brightness (rough)
-            brightness = int(0.2126 * r + 0.7152 * g + 0.0722 * b)
-            avg_hex = f"#{r:02x}{g:02x}{b:02x}"
-
-            # classify common aspect ratios roughly
-            ar = ""
-            if 1.7 <= aspect <= 1.85:
-                ar = "16:9附近"
-            elif 0.95 <= aspect <= 1.05:
-                ar = "1:1附近"
-            elif 1.3 <= aspect <= 1.4:
-                ar = "4:3附近"
-            elif aspect > 1.9:
-                ar = "超宽屏"
-            elif aspect < 0.9:
-                ar = "竖图"
-
-            return (
-                f"分辨率: {w}x{h}（{ar}）\n"
-                f"平均色: {avg_hex}；亮度(0-255): {brightness}\n"
-                "建议用法: 把画面构图/主体位置/光影对比/色调参考此图，细节以文字为准。"
-            )
-    except Exception as e:
-        return f"（图片技术摘要提取失败: {e}）"
+    @staticmethod
+    def _summarize_image(image_path: str) -> str:
+        """Generate technical summary of an image."""
+        try:
+            from PIL import Image
+            from math import gcd
+            img = Image.open(image_path)
+            w, h = img.size
+            g = gcd(w, h)
+            ratio = f"{w // g}:{h // g}"
+            small = img.resize((1, 1))
+            avg = small.getpixel((0, 0))
+            avg_str = f"RGB({avg[0]},{avg[1]},{avg[2]})" if isinstance(avg, (tuple, list)) and len(avg) >= 3 else str(avg)
+            gray = img.convert("L")
+            pixels = list(gray.getdata())
+            brightness = sum(pixels) / len(pixels) if pixels else 128
+            tone = "偏暗" if brightness < 100 else "中等" if brightness < 170 else "偏亮"
+            return f"分辨率: {w}x{h} | 比例: {ratio} | 平均色: {avg_str} | 亮度: {brightness:.0f}/255 | 色调: {tone}"
+        except Exception as e:
+            return f"图片分析失败: {e}"

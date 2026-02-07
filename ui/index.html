@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Director</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+</head>
+<body>
+    <!-- ═══ Top Bar ═══ -->
+    <header id="topbar">
+        <div class="topbar-left">
+            <span class="logo">⎯ Smart Director</span>
+            <span class="version">v2</span>
+        </div>
+        <div class="topbar-center">
+            <span id="project-name">未命名项目</span>
+        </div>
+        <div class="topbar-right">
+            <span id="token-counter" title="Token 用量">🔤 0</span>
+            <span id="status-dot" class="dot dot-idle" title="就绪"></span>
+        </div>
+    </header>
+
+    <!-- ═══ Main Layout: 3 columns ═══ -->
+    <div id="app">
+        <!-- ── Left: vibe Console ── -->
+        <aside id="vibe-panel">
+            <div class="panel-header">
+                <h3>vibe 控制台</h3>
+            </div>
+
+            <!-- Image Drop Zone -->
+            <div class="section">
+                <label class="section-label">参考图片</label>
+                <div id="image-drop" class="drop-zone" ondragover="event.preventDefault()" ondrop="handleDrop(event)">
+                    <div id="image-preview" class="drop-placeholder">
+                        <span>拖放图片到这里<br>或点击上传</span>
+                    </div>
+                    <input type="file" id="image-input" accept="image/*" hidden>
+                </div>
+                <div id="image-summary" class="image-summary"></div>
+            </div>
+
+            <!-- Preset -->
+            <div class="section">
+                <label class="section-label">预设风格</label>
+                <select id="vibe-preset" class="vibe-select">
+                    <option value="Cinematic Noir（电影黑色）">Cinematic Noir（电影黑色）</option>
+                    <option value="Dreamcore（梦核）">Dreamcore（梦核）</option>
+                    <option value="Cyber Neon（赛博霓虹）">Cyber Neon（赛博霓虹）</option>
+                    <option value="Documentary Grit（纪实颗粒）">Documentary Grit（纪实颗粒）</option>
+                    <option value="Anime Live-Action Mix（动画写实混合）">Anime Live-Action Mix（动画写实混合）</option>
+                </select>
+            </div>
+
+            <!-- Sliders -->
+            <div class="section">
+                <label class="section-label">
+                    细节密度 <span id="detail-val" class="slider-val">50</span>
+                </label>
+                <input type="range" id="vibe-detail" class="vibe-slider" min="0" max="100" value="50">
+            </div>
+
+            <div class="section">
+                <label class="section-label">
+                    氛围强度 <span id="atmo-val" class="slider-val">50</span>
+                </label>
+                <input type="range" id="vibe-atmo" class="vibe-slider" min="0" max="100" value="50">
+            </div>
+
+            <!-- Toggles -->
+            <div class="section toggles">
+                <label class="toggle-row">
+                    <input type="checkbox" id="vibe-short" checked>
+                    <span>短提示优先</span>
+                </label>
+                <label class="toggle-row">
+                    <input type="checkbox" id="vibe-lock" checked>
+                    <span>参数锁定</span>
+                </label>
+            </div>
+
+            <!-- Locked Params -->
+            <div id="locked-params" class="section locked-params">
+                <div class="param-row">
+                    <label>比例</label>
+                    <select id="vibe-aspect" class="param-select">
+                        <option value="16:9">16:9</option>
+                        <option value="9:16">9:16</option>
+                        <option value="1:1">1:1</option>
+                    </select>
+                </div>
+                <div class="param-row">
+                    <label>时长</label>
+                    <input type="number" id="vibe-duration" class="param-input" min="2" max="15" value="5">
+                    <span class="param-unit">s</span>
+                </div>
+                <div class="param-row">
+                    <label>帧率</label>
+                    <select id="vibe-fps" class="param-select">
+                        <option value="24">24fps</option>
+                        <option value="30">30fps</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Sessions -->
+            <div class="section">
+                <label class="section-label">会话管理</label>
+                <select id="session-list" class="vibe-select">
+                    <option value="">选择会话...</option>
+                </select>
+                <div class="session-buttons">
+                    <button class="btn btn-sm" onclick="saveSession()">保存</button>
+                    <button class="btn btn-sm" onclick="loadSession()">加载</button>
+                    <button class="btn btn-sm btn-danger" onclick="deleteSession()">删除</button>
+                </div>
+            </div>
+        </aside>
+
+        <!-- ── Center: Chat ── -->
+        <main id="chat-panel">
+            <div id="chat-messages" class="messages-container">
+                <!-- Messages will be inserted here -->
+                <div class="message system-message">
+                    <div class="msg-role">系统</div>
+                    <div class="msg-content">
+                        把你的想法写粗一点也没关系，我会追问补全，最后输出可直接粘贴的提示词。
+                        你可以上传参考图片、使用语音输入或点击选项回答。
+                    </div>
+                </div>
+            </div>
+
+            <!-- Options area (for A/B/C/D quick picks) -->
+            <div id="options-bar" class="options-bar hidden"></div>
+
+            <!-- Final prompt display -->
+            <div id="final-prompt-panel" class="final-prompt hidden">
+                <div class="final-header">
+                    <span>📋 最终提示词</span>
+                    <button class="btn btn-sm" onclick="copyFinalPrompt()">复制</button>
+                </div>
+                <pre id="final-prompt-text"></pre>
+            </div>
+
+            <!-- Input area -->
+            <div id="input-area" class="input-area">
+                <textarea id="user-input" placeholder="描述你想要的视频（主题/人物/场景/氛围/风格/时长/比例/音乐等，知道多少写多少）..."
+                          rows="3"></textarea>
+                <div class="input-actions">
+                    <button class="btn btn-primary" id="btn-send" onclick="sendMessage()">
+                        发送
+                    </button>
+                    <button class="btn btn-accent" onclick="forceFinalize()">
+                        直接总结
+                    </button>
+                    <button class="btn" onclick="resetChat()">
+                        重置
+                    </button>
+                </div>
+            </div>
+        </main>
+
+        <!-- ── Right: History / Storyboard ── -->
+        <aside id="right-panel">
+            <div class="panel-header">
+                <h3>生成历史</h3>
+            </div>
+            <div id="history-list" class="history-list">
+                <div class="history-empty">还没有生成记录</div>
+            </div>
+
+            <!-- Checklist -->
+            <div class="panel-header" style="margin-top:16px">
+                <h3>信息完成度</h3>
+            </div>
+            <div id="checklist" class="checklist"></div>
+        </aside>
+    </div>
+
+    <script src="main.js"></script>
+</body>
+</html>
